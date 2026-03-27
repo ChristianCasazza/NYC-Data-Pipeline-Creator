@@ -19,6 +19,8 @@ nyc_311_schema: SchemaContract = {
 
 nyc_311_pipeline = create_socrata_pipeline(
     name="nyc_311_sample",
+    domain="operations",
+    geographic_scope="nyc",
     socrata_config=SocrataIngestConfig(
         endpoint="erm2-nwe9",
         time_col="created_date",

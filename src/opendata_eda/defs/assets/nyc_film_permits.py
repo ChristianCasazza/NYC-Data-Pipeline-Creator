@@ -17,6 +17,8 @@ film_permits_schema: SchemaContract = {
 
 film_permits_pipeline = create_socrata_pipeline(
     name="nyc_film_permits",
+    domain="operations",
+    geographic_scope="nyc",
     socrata_config=SocrataIngestConfig(
         endpoint="tg4x-b46p",
         time_col="startdatetime",

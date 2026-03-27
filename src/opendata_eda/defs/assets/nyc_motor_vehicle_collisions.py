@@ -40,6 +40,8 @@ collisions_schema: SchemaContract = {
 
 collisions_pipeline = create_socrata_pipeline(
     name="nyc_motor_vehicle_collisions",
+    domain="public_safety",
+    geographic_scope="nyc",
     socrata_config=SocrataIngestConfig(
         endpoint="h9gi-nx95",
         time_col="crash_date",

@@ -23,6 +23,8 @@ dsny_tonnage_schema: SchemaContract = {
 
 dsny_tonnage_pipeline = create_socrata_pipeline(
     name="nyc_dsny_monthly_tonnage",
+    domain="sanitation",
+    geographic_scope="nyc",
     socrata_config=SocrataIngestConfig(
         endpoint="ebb7-mvp5",
         time_col="month",
