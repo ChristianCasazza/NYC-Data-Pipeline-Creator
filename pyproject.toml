@@ -1,0 +1,55 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "opendata-eda"
+version = "0.1.0"
+description = "QueryStation EDA toolkit — remote DuckDB queries, Dagster pipelines, and NYC open data exploration"
+requires-python = ">=3.10"
+
+dependencies = [
+    # Workspace packages
+    "opendata-framework",
+    "data-consumers",
+
+    # Orchestration
+    "dagster>=1.12.10",
+    "dagster-webserver>=1.12.10",
+    "dagster-dg-cli>=1.12.10",
+
+    # Display
+    "rich>=13.0.0",
+
+    # Auth / env
+    "python-dotenv>=1.0.0",
+]
+
+[tool.uv.sources]
+opendata-framework = { workspace = true }
+data-consumers = { workspace = true }
+
+[project.optional-dependencies]
+notebook = [
+    "jupyterlab>=4.0.0",
+    "ipykernel>=6.0.0",
+    "pandas>=2.0.0",
+]
+
+[project.scripts]
+query-remote = "scripts.query_remote:main"
+
+[tool.dagster]
+module_name = "opendata_eda.definitions"
+
+[tool.dg]
+directory_type = "project"
+
+[tool.dg.project]
+root_module = "opendata_eda"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/opendata_eda", "packages/opendata_framework", "packages/data_consumers", "scripts"]
+
+[tool.uv.workspace]
+members = ["packages/*"]

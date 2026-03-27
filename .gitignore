@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+*.egg-info/
+dist/
+build/
+.env
+data/
+logs/
+.venv/
+*.parquet
+.tmp_dagster_home_*

@@ -1,0 +1,24 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "opendata-framework"
+version = "0.1.0"
+description = "Dagster resources, IO managers, and ingestion factories for open data pipelines"
+requires-python = ">=3.10"
+
+dependencies = [
+    "dagster>=1.12.10",
+    "duckdb>=1.4.0",
+    "polars>=1.8.0",
+    "pyarrow>=17.0.0",
+    "requests>=2.32.3",
+    "tenacity>=9.0.0",
+    "sqlglot>=26.30.0",
+    "universal_pathlib>=0.2.0",
+    "pyyaml>=6.0",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["opendata_framework"]
