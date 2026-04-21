@@ -1,11 +1,17 @@
-# OpenDataWeek-API
+# NYC-Data-Pipeline-Creator
 
-NYC open data EDA and pipeline toolkit. Ingest datasets from Socrata, materialize them as parquet via Dagster, and query them locally or remotely via QueryStation.
+NYC open data EDA and pipeline toolkit. Three ways to get data into the Dagster asset graph:
+
+1. **Socrata ingestion** — `create_socrata_pipeline()` produces landing (CSV) + clean (Parquet) stages.
+2. **QueryStation remote SQL** — `.sql` file with `source: querystation` in frontmatter. Executes against QueryStation's Arrow IPC endpoint and caches result as Parquet.
+3. **Local DuckDB JIT SQL** — default `.sql` backend. Builds ephemeral views over upstream Parquet (any backend) and writes the result.
+
+All three share the same IO manager (`./data/clean/`), so downstream SQL assets can join across backends transparently.
 
 ## Repo Structure
 
 ```
-OpenDataWeek-API/
+NYC-Data-Pipeline-Creator/
 ├── src/opendata_eda/
 │   ├── definitions.py              # Entry point — loads defs/ via load_from_defs_folder()
 │   └── defs/
@@ -29,7 +35,7 @@ OpenDataWeek-API/
 │   └── query_remote.py             # CLI for remote DuckDB queries via QueryStation
 ├── notebooks/
 │   ├── query_local.ipynb           # Query local parquet files (Polars + DuckDB)
-│   └── query_remote.ipynb          # Query remote DuckLake via Arrow IPC API
+│   └── query_remote.ipynb          # Query remote QueryStation tables via Arrow IPC API
 ├── reports/                        # Investigation reports
 ├── data/                           # Materialized output (gitignored)
 │   ├── landing/                    # Landing stage (gzipped CSV)
@@ -77,8 +83,20 @@ The project uses Dagster's `load_from_defs_folder()` for automatic asset discove
 | `nyc_floodnet_flooding_events` | aq7i-eu5q | Unpartitioned | Flood event measurements |
 | `nyc_floodnet_events_joined` | — | Unpartitioned (`@asset`) | Events enriched with metadata, severity, hydro metrics |
 | `nyc_dsny_monthly_tonnage` | ebb7-mvp5 | Unpartitioned | DSNY monthly collection tonnage by community district |
+| `nyc_motor_vehicle_collisions` | h9gi-nx95 | Unpartitioned | NYPD-reported motor vehicle crashes |
 
-#### SQL Analytics Assets
+#### QueryStation Remote Assets
+
+Authored as `.sql` files with `source: querystation` in frontmatter. Executed against QueryStation's Arrow IPC endpoint at materialization time; result cached as Parquet.
+
+| Asset | Upstream table | Type | Description |
+|---|---|---|---|
+| `mta_ridership_by_mode` | `lake.nys_transportation.mta_daily_ridership` | Unpartitioned | All-years per-mode totals |
+| `mta_ridership_yearly` | `lake.nys_transportation.mta_daily_ridership` | Yearly-partitioned | One remote query per year, Hive-layout output |
+| `nyc_air_quality_annual` | `lake.nyc_environment.air_quality` | Unpartitioned | Annual NO2/PM2.5/O3 means |
+| `nyc_311_top_heat_bbls_by_cb` | `lake.nyc_operations.service_requests_311` | Unpartitioned | Top 10 BBLs per community board by heat complaints |
+
+#### SQL Analytics Assets (local DuckDB-JIT)
 
 | Asset | Upstream | Description |
 |---|---|---|
@@ -86,6 +104,17 @@ The project uses Dagster's `load_from_defs_folder()` for automatic asset discove
 | `dsny_tonnage_borough_monthly` | `nyc_dsny_monthly_tonnage` | Borough-level monthly aggregates |
 | `dsny_tonnage_district_rankings` | `nyc_dsny_monthly_tonnage` | District rankings by refuse + recycling rate |
 | `dsny_tonnage_organics_rollout` | `nyc_dsny_monthly_tonnage` | Organics adoption tracking by borough/year |
+| `collisions_annual_summary` | `nyc_motor_vehicle_collisions` | Year-over-year collision counts |
+| `collisions_borough_monthly` | `nyc_motor_vehicle_collisions` | Borough × month breakdowns |
+| `collisions_contributing_factors` | `nyc_motor_vehicle_collisions` | Top contributing factors |
+| `transit_vs_air_quality` | `mta_ridership_yearly`, `nyc_air_quality_annual` | **Cross-backend join** — combines QueryStation-sourced MTA and air-quality Parquet |
+
+#### Dagster Group Organization
+
+| Group prefix | Contents |
+|---|---|
+| `nyc__{domain}` | Socrata-ingested assets and their local-JIT analytics (e.g., `nyc__sanitation`, `nyc__public_safety`, `nyc__operations`, `nyc__environment`) |
+| `querystation__{domain}` | QueryStation-sourced remote assets, isolated from Socrata groups. Current: `querystation__transportation`, `querystation__environment`, `querystation__operations`, `querystation__analytics` |
 
 ### Adding New Socrata Assets
 
@@ -136,13 +165,91 @@ SELECT ... FROM nyc_dsny_monthly_tonnage ...
 
 SQL assets are auto-discovered by `discover_sql_assets()` in `defs/assets/sql_assets/__init__.py` — no manual wiring needed.
 
+### Adding New QueryStation Remote Assets
+
+Same file location as local SQL analytics. Two additions to frontmatter:
+
+- `source: querystation` — switches execution backend from local DuckDB-JIT to remote Arrow IPC.
+- `partitions:` (optional) — yearly/monthly partitioning. SQL uses `{{partition_start}}` / `{{partition_end}}` (date literals) or `{{partition_start_ts}}` / `{{partition_end_ts}}` (TZ-aware timestamp literals).
+
+**Unpartitioned (simplest):**
+
+```sql
+/*---
+name: nyc_restaurant_inspections_recent
+source: querystation
+description: ...
+group: querystation__health
+---*/
+SELECT * FROM lake.nyc_health.restaurant_inspections
+WHERE inspection_date >= '2025-01-01'
+```
+
+**Partitioned:**
+
+```sql
+/*---
+name: my_partitioned_remote_asset
+source: querystation
+description: ...
+group: querystation__domain
+partitions:
+  type: yearly              # or: monthly
+  start: "2020"             # format depends on type: "YYYY" for yearly, "YYYY-MM-DD" for monthly
+  end_offset: 1             # optional; include future/current partition
+  tz: America/New_York      # optional; default America/New_York
+---*/
+SELECT ... FROM lake.schema.table
+WHERE date >= {{partition_start}}
+  AND date <  {{partition_end}}
+```
+
+**Templating tokens supported by `render_sql()`** (in `packages/opendata_framework/opendata_framework/core/sql/runner_querystation.py`):
+
+| Token | Renders as | When to use |
+|---|---|---|
+| `{{partition_start}}` | `'YYYY-MM-DD'` | DATE columns in partition-local tz |
+| `{{partition_end}}` | `'YYYY-MM-DD'` | DATE columns in partition-local tz |
+| `{{partition_start_ts}}` | `'YYYY-MM-DD HH:MM:SS±HH:MM'` | `TIMESTAMP WITH TIME ZONE` columns |
+| `{{partition_end_ts}}` | `'YYYY-MM-DD HH:MM:SS±HH:MM'` | `TIMESTAMP WITH TIME ZONE` columns |
+| `{{partition_key}}` | `'key'` | Static/string partitions; rejects SQL-unsafe chars |
+
+Missing context (token referenced but partition not time-partitioned, or key omitted) raises at render time — fails fast instead of sending malformed SQL or a full-table scan per partition.
+
+**What you get automatically:**
+
+- Arrow IPC round-trip via `QueryStationResource` (registered in `definitions.py`)
+- Result cached as Parquet under `data/clean/{asset_name}/...`
+- Hive-layout output for partitioned assets (`year=2024/...`)
+- Auto-generated row-count asset check
+- `RetryPolicy(max_retries=3, delay=30, backoff=EXPONENTIAL)` for transient network/auth failures
+- Lineage visible in Dagster UI alongside Socrata and local-JIT assets
+- Downstream local SQL assets can reference the asset by name and auto-mount its Parquet via DuckDB JIT views
+
+**Python factory alternative** (when you need a custom `PartitionsDefinition`, `AutomationCondition`, or anything the frontmatter YAML doesn't expose):
+
+```python
+# src/opendata_eda/defs/assets/my_remote.py
+from opendata_framework.dagster import create_querystation_sql_asset, yearly_partitions
+
+my_remote_items = create_querystation_sql_asset(
+    name="my_remote_asset",
+    sql="SELECT ... FROM lake.foo.bar WHERE date >= {{partition_start}}",
+    partitions_def=yearly_partitions("2020", end_offset=1),
+    group="querystation__domain",
+    tags={"domain": "foo"},
+)
+```
+
+Both paths share the same `render_sql()` core.
+
 ## Data Paths
 
 | Stage | Path Pattern |
 |---|---|
 | Landing | `data/landing/{asset_name}/...` |
 | Clean (single) | `data/clean/{asset_name}/{asset_name}.parquet` |
-| Clean (partitioned) | `data/clean/{asset_name}/year={YYYY}/{asset_name}.parquet` |
+| Clean (yearly partitioned) | `data/clean/{asset_name}/year={YYYY}/{asset_name}_{YYYY}.parquet` |
 | SQL Analytics | `data/clean/{asset_name}/{asset_name}.parquet` |
 | Exports | `data/exports/{name}.{format}` |
 
@@ -163,9 +270,11 @@ Set in `.env` (loaded automatically by Dagster and python-dotenv):
 
 | Variable | Required For | Description |
 |---|---|---|
-| `SOCRATA_API_TOKEN` | Pipeline materialization | NYC Open Data API token |
-| `QUERYSTATION_API_KEY` | Remote queries | QueryStation `sk_` API key |
-| `AUTH_URL` | Remote queries | Auth endpoint (e.g., `http://localhost:3100`) |
+| `SOCRATA_API_TOKEN` | Socrata pipeline materialization | NYC Open Data API token |
+| `QUERYSTATION_API_KEY` | QueryStation assets + CLI queries | QueryStation `sk_` API key |
+| `AUTH_URL` | QueryStation assets + CLI queries | Auth endpoint (prod: `https://api.querystation.app`) |
+
+Both the Dagster CLI and `scripts/query_remote.py` auto-load `.env`. See Gotcha #8 if you're testing with env overrides.
 
 ## Dagster Commands
 
@@ -182,19 +291,25 @@ Without it, Dagster cannot find the definitions and will error with "Invalid set
 ### Materialize assets
 
 ```bash
-# Unpartitioned asset (full ingest) — landing then clean
+# Socrata: landing then clean (sequential)
 DAGSTER_HOME=$(pwd)/logs uv run dagster asset materialize -m opendata_eda.definitions --select nyc_floodnet_sensor_metadata_landing
 DAGSTER_HOME=$(pwd)/logs uv run dagster asset materialize -m opendata_eda.definitions --select nyc_floodnet_sensor_metadata
 
-# Partitioned asset (pick one partition)
+# Socrata partitioned (pick one partition)
 DAGSTER_HOME=$(pwd)/logs uv run dagster asset materialize -m opendata_eda.definitions --select nyc_311_sample_landing --partition "2026-01-01"
 DAGSTER_HOME=$(pwd)/logs uv run dagster asset materialize -m opendata_eda.definitions --select nyc_311_sample --partition "2026"
 
-# SQL analytics asset (no landing step needed — reads from upstream parquet)
+# Local SQL analytics (reads upstream Parquet, no landing step)
 DAGSTER_HOME=$(pwd)/logs uv run dagster asset materialize -m opendata_eda.definitions --select dsny_tonnage_annual_summary
+
+# QueryStation remote (one shot)
+DAGSTER_HOME=$(pwd)/logs uv run dagster asset materialize -m opendata_eda.definitions --select mta_ridership_by_mode
+
+# QueryStation partitioned (one partition per invocation)
+DAGSTER_HOME=$(pwd)/logs uv run dagster asset materialize -m opendata_eda.definitions --select mta_ridership_yearly --partition 2024
 ```
 
-Landing must complete before clean — run them sequentially. SQL assets depend on clean assets.
+Landing must complete before clean — run them sequentially. SQL assets depend on clean assets. QueryStation assets have no landing step; they write Parquet directly.
 
 ### Validate definitions load
 
@@ -227,7 +342,7 @@ For partitioned assets:
 ```bash
 uv run python -c "
 import polars as pl
-df = pl.read_parquet('data/clean/nyc_311_sample/year=2026/nyc_311_sample.parquet')
+df = pl.read_parquet('data/clean/nyc_311_sample/year=2026/nyc_311_sample_2026.parquet')
 print(f'Rows: {len(df)}, Cols: {len(df.columns)}')
 print(df.head(3))
 "
@@ -246,11 +361,31 @@ The validation one-liner uses `defs.resolve_asset_graph().get_all_asset_keys()`.
 ### 3. Use `TRY_CAST` not `CAST` in DuckDB SQL
 When parsing string fields (like the `month` column in DSNY tonnage which is `"YYYY / MM"`), always use `TRY_CAST(trim(...) AS INT)` instead of `CAST(... AS INT)`. `CAST` throws a hard `ConversionException` on any edge-case empty or malformed string. `TRY_CAST` returns `NULL` instead.
 
-### 4. SQL asset CTE names become phantom dependencies
-The SQL parser (`extract_table_names()` in `opendata_framework.core.sql.parser`) uses sqlglot which does not filter out CTE names. A `WITH foo AS (...)` will register `foo` as an upstream dependency. The runner handles this gracefully (creates an empty fallback view, logs a warning), but to keep the asset graph clean, **prefix CTE names with an underscore** (e.g., `_parsed`, `_recent`) so they're obviously not real assets.
+### 4. SQL parser CTE handling (fixed)
+`extract_table_names()` in `opendata_framework.core.sql.parser` now subtracts CTE names from extracted tables (`names - cte_names`), so `WITH ridership AS (...) SELECT * FROM ridership` no longer registers a phantom `ridership` dep. The parser also exposes `extract_qualified_table_names()` for catalog-qualified 3-part names — used by the footgun guard described in #7. Prefixing CTEs with `_` is no longer required for correctness, but still a readable convention.
 
 ### 5. SQL asset IO manager names
 SQL assets (via `discover_sql_assets`) expect these resource keys in `defs`: `analytics_io_manager`, `clean_io_manager`, `raw_large_io_manager`. All must be registered in the `resources={}` dict of `dg.Definitions`. Currently they all point to `PolarsParquetIOManager` instances.
+
+### 6. DuckDB `/` is float division, not integer
+`SELECT 212 / 100` returns `2.12` (DOUBLE), not `2`. Using `cb_number / 100` inside a `CASE WHEN 1 THEN ...` will silently never match and return NULL for every row. Use `//` (Python-style integer division) or `CAST(expr AS INT)`:
+
+```sql
+-- WRONG: borough column will be all NULL
+CASE cb_number / 100 WHEN 2 THEN 'BRONX' ... END
+
+-- CORRECT
+CASE cb_number // 100 WHEN 2 THEN 'BRONX' ... END
+```
+
+### 7. QueryStation asset missing `source: querystation` — discovery raises
+`discover_sql_assets` uses `extract_qualified_table_names()` to detect fully-qualified 3-part names (e.g. `lake.nyc_operations.service_requests_311`) in the SQL body. If any are present AND `source:` is not `querystation`, discovery raises `RuntimeError` with an actionable message at Dagster startup. Fix by adding `source: querystation` or replacing FQNs with local asset names.
+
+### 8. Dagster auto-loads `.env`, overriding shell env
+When writing a test that needs to override `QUERYSTATION_API_KEY` / `AUTH_URL`, shell-level env vars get silently replaced by `.env` values. Either rename `.env` during the test or set the env in a fresh process that doesn't inherit dotenv. Verified during retry-policy end-to-end testing.
+
+### 9. QueryStation retry delays are long by design
+`RetryPolicy(max_retries=3, delay=30, backoff=EXPONENTIAL)` → attempts at 0s, 30s, 90s, 210s. A single materialization that exhausts all retries can take ~6 minutes. Do not set wrapping timeouts below 360s when testing retry behavior.
 
 ## Agent Skills
 
@@ -259,7 +394,7 @@ Four skills are available in `.agents/skills/`:
 ### querystation
 **Trigger:** "query remote", "remote duckdb", "lake.", "iceberg.", "what tables are available remotely"
 
-Remote DuckDB query tool via QueryStation Arrow IPC API. Query DuckLake and Iceberg catalogs containing 17+ NYC datasets (311, capital budget, payroll, restaurant inspections, FloodNet, MTA, etc.).
+Remote DuckDB query tool via QueryStation Arrow IPC API. Query remote catalogs containing 17+ NYC datasets (311, capital budget, payroll, restaurant inspections, FloodNet, MTA, etc.).
 
 - **SKILL.md** — Full API reference, table catalog, query patterns, troubleshooting
 - **prompts/** — 12 pre-built query prompt templates by domain (311, finance, FloodNet, cross-dataset, data quality, export)
@@ -278,7 +413,7 @@ Read-only DuckDB queries against local parquet files in `data/clean/`. For profi
 ### socrata-builder
 **Trigger:** "add socrata asset", "ingest this dataset", "create pipeline for", Socrata URL pasted
 
-Generates new Dagster Socrata pipelines from a dataset URL. Fetches metadata, recommends partitioning, generates code for `definitions.py`.
+Generates new Dagster Socrata pipelines from a dataset URL. Fetches metadata, recommends partitioning, and creates a new asset module under `src/opendata_eda/defs/assets/`.
 
 - **SKILL.md** — Full workflow (fetch metadata → review → generate → validate → materialize)
 - **scripts/fetch_socrata_metadata.py** — Extracts schema, row count, partitioning recommendation from any Socrata URL

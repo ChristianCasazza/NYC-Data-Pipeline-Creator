@@ -45,12 +45,18 @@ from opendata_framework.dagster.assets.sql_assets import (
     discover_sql_assets as discover_sql_assets,
 )
 
+# --- QueryStation factory ---
+from opendata_framework.dagster.querystation_factory import (
+    create_querystation_sql_asset as create_querystation_sql_asset,
+)
+
 # --- Resources ---
 from opendata_framework.dagster.resources import (
     CheckbookNYCResource as CheckbookNYCResource,
     JsonIOManager as JsonIOManager,
     LandingIOManager as LandingIOManager,
     PolarsParquetIOManager as PolarsParquetIOManager,
+    QueryStationResource as QueryStationResource,
     SocrataResource as SocrataResource,
 )
 
@@ -73,9 +79,11 @@ __all__ = [
     "SchemaContract",
     # SQL
     "discover_sql_assets",
+    "create_querystation_sql_asset",
     # Resources
     "SocrataResource",
     "CheckbookNYCResource",
+    "QueryStationResource",
     "JsonIOManager",
     "LandingIOManager",
     "PolarsParquetIOManager",

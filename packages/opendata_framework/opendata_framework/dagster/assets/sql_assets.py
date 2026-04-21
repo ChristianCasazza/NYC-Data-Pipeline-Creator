@@ -13,11 +13,73 @@ from collections.abc import Sequence
 import duckdb
 import polars as pl
 import dagster as dg
-from dagster import AssetKey, AutomationCondition, MaterializeResult, MetadataValue
+from dagster import (
+    AssetKey,
+    AutomationCondition,
+    Backoff,
+    MaterializeResult,
+    MetadataValue,
+    RetryPolicy,
+)
+
+# QueryStation requests are per-asset (not per-page), so a single transient
+# 502 should not fail a multi-partition backfill. Mirrors the Socrata landing
+# asset's retry policy with a shorter base delay — QueryStation queries are
+# typically seconds, not minutes.
+_QUERYSTATION_RETRY = RetryPolicy(max_retries=3, delay=30, backoff=Backoff.EXPONENTIAL)
 
 from opendata_framework.core.sql.discovery import discover_sql_specs
-from opendata_framework.core.sql.parser import extract_table_names
+from opendata_framework.core.sql.parser import (
+    extract_qualified_table_names,
+    extract_table_names,
+)
 from opendata_framework.core.sql.runner_duckdb import run_sql_in_duckdb
+from opendata_framework.core.sql.runner_querystation import render_sql
+from opendata_framework.dagster.partitions import monthly_partitions, yearly_partitions
+
+# Known remote backends that legitimately reference fully-qualified names.
+_REMOTE_SOURCES = {"querystation", "ducklake"}
+
+
+def _parse_partitions_spec(spec: dict[str, Any] | None):
+    """Build a PartitionsDefinition from a frontmatter ``partitions:`` block.
+
+    Supported shapes::
+
+        partitions:
+          type: yearly
+          start: "2020"
+          end_offset: 1
+
+        partitions:
+          type: monthly
+          start: "2024-01-01"
+          end_offset: 1
+    """
+    if not spec:
+        return None
+    kind = spec.get("type")
+    tz = spec.get("tz", "America/New_York")
+    if kind == "yearly":
+        return yearly_partitions(
+            start=spec["start"],
+            end=spec.get("end"),
+            end_offset=int(spec.get("end_offset", 0)),
+            tz=tz,
+        )
+    if kind == "monthly":
+        start = spec.get("start_date") or spec.get("start")
+        if start is None:
+            raise ValueError("monthly partitions require 'start' (or 'start_date')")
+        end = spec.get("end_date") or spec.get("end")
+        end_offset = spec.get("end_offset")
+        return monthly_partitions(
+            start_date=start,
+            end_date=end,
+            end_offset=int(end_offset) if end_offset is not None else None,
+            tz=tz,
+        )
+    raise ValueError(f"Unknown partitions.type: {kind!r}")
 
 
 def _markdown_table(df: pl.DataFrame, rows: int = 5) -> str:
@@ -39,20 +101,23 @@ def _build_asset_core(
     meta: dict[str, Any],
     extra_deps: Sequence[str] | None,
     group: str,
+    partitions_def: Any | None = None,
 ) -> list[tuple[str, Any]]:
     """
-    Constructs a SQL asset. Uses DuckLake execution when ``source: ducklake``
-    is set in frontmatter, otherwise stateless JIT over Parquet files.
+    Constructs a SQL asset. Uses the private remote execution hook when its
+    source is selected, otherwise stateless JIT over Parquet files.
     """
-    is_ducklake = meta.get("source") == "ducklake"
+    source = meta.get("source")
+    is_ducklake = source == "ducklake"
+    is_querystation = source == "querystation"
 
     # 1. Calculate Dependencies
     declared = set(meta.get("deps", []))
     extras   = set(extra_deps or [])
 
-    if is_ducklake:
-        # DuckLake: deps are scheduling-only (no implicit SQL parsing).
-        # The SQL references opendata_lake.schema.table directly.
+    if is_ducklake or is_querystation:
+        # Remote backends: deps are scheduling-only (no implicit SQL parsing).
+        # SQL references remote qualified names (e.g. lake.schema.table).
         run_deps = sorted(declared | extras)
     else:
         # Parquet: implicit deps via SQL table-name parsing
@@ -62,10 +127,17 @@ def _build_asset_core(
     # 2. Define Dagster Deps (Upstream Assets only)
     dagster_deps = [AssetKey(k) for k in run_deps]
 
+    if is_ducklake:
+        execution_mode = "ducklake"
+    elif is_querystation:
+        execution_mode = "querystation_remote"
+    else:
+        execution_mode = "stateless_jit"
+
     static_md = {
         "sql": MetadataValue.md(f"```sql\n{sql}\n```"),
         "schema": MetadataValue.json(meta),
-        "execution_mode": "ducklake" if is_ducklake else "stateless_jit",
+        "execution_mode": execution_mode,
     }
     tags = {str(k): str(v) for k, v in (meta.get("tags", {}) or {}).items()}
 
@@ -75,6 +147,9 @@ def _build_asset_core(
     if is_ducklake:
         resource_keys = {"ducklake", "analytics_io_manager"}
         asset_kinds = {"ducklake", "sql", "parquet"}
+    elif is_querystation:
+        resource_keys = {"querystation", "analytics_io_manager"}
+        asset_kinds = {"querystation", "remote", "sql"}
     else:
         resource_keys = {"clean_io_manager", "analytics_io_manager", "raw_large_io_manager"}
         asset_kinds = {"duckdb", "sql", "parquet"}
@@ -88,6 +163,8 @@ def _build_asset_core(
         required_resource_keys=resource_keys,
         metadata=static_md,
         tags=tags,
+        partitions_def=partitions_def,
+        retry_policy=_QUERYSTATION_RETRY if is_querystation else None,
         automation_condition=AutomationCondition.eager(),
     )
     def _asset(context) -> MaterializeResult:
@@ -99,6 +176,33 @@ def _build_asset_core(
                 sql=sql,
                 ducklake_resource=context.resources.ducklake,
             )
+        elif is_querystation:
+            op = context.op_execution_context
+            partition_key = op.partition_key if op.has_partition_key else None
+            partition_start = None
+            partition_end = None
+            if op.has_partition_key:
+                try:
+                    window = op.partition_time_window
+                    partition_start = window.start
+                    partition_end = window.end
+                except Exception as exc:
+                    # Static/string partitions don't have a time window.
+                    # If the SQL uses {{partition_start}}/{{partition_end}}/*_ts
+                    # tokens, render_sql will raise — which is what we want.
+                    context.log.debug(f"No partition_time_window for {partition_key}: {exc}")
+            rendered = render_sql(
+                sql,
+                partition_key=partition_key,
+                partition_start=partition_start,
+                partition_end=partition_end,
+            )
+            context.log.info(
+                f"[QueryStation] {asset_name}"
+                f"{' partition=' + partition_key if partition_key else ''} "
+                f"({len(rendered)} chars)"
+            )
+            df = context.resources.querystation.query(rendered)
         else:
             io_managers = [
                 context.resources.analytics_io_manager,
@@ -125,8 +229,8 @@ def _build_asset_core(
     check_name = f"{asset_name}_row_count_check"
 
     @dg.asset_check(
-        name=check_name, 
-        asset=AssetKey(asset_name), 
+        name=check_name,
+        asset=AssetKey(asset_name),
         blocking=True,
         required_resource_keys={"analytics_io_manager"},
         description="Fails if 0 rows are produced."
@@ -135,8 +239,11 @@ def _build_asset_core(
         io_manager = context.resources.analytics_io_manager
         glob_pattern = io_manager.get_glob_pattern(AssetKey(asset_name), recursive=True)
         asset_root = io_manager.get_path_for_asset(AssetKey(asset_name))
-        
-        if not asset_root.exists():
+
+        # For partitioned Hive-layout assets, the flat-file path never exists —
+        # only subdirectories (year=YYYY/...) do. Fall back to checking the
+        # containing directory, which is what the glob actually scans.
+        if not asset_root.exists() and not asset_root.parent.exists():
              return dg.AssetCheckResult(
                 passed=False,
                 severity=dg.AssetCheckSeverity.ERROR,
@@ -197,12 +304,31 @@ def discover_sql_assets(
 
     registry: dict[str, Any] = {}
     for spec in sql_specs:
+        # Footgun guard: a SQL file referencing fully-qualified names like
+        # ``lake.schema.table`` but lacking a remote ``source:`` will silently
+        # fall back to local JIT, which can't resolve the qualified name and
+        # emits a generic "Could not locate data" warning. Raise clearly
+        # instead so the author fixes the frontmatter at discovery time.
+        qualified = extract_qualified_table_names(spec.sql)
+        declared_source = spec.meta.get("source")
+        if qualified and declared_source not in _REMOTE_SOURCES:
+            raise RuntimeError(
+                f"SQL asset {spec.name!r} references fully-qualified remote "
+                f"tables {sorted(qualified)} but has no remote "
+                f"'source:' set in frontmatter. "
+                f"Add 'source: querystation' (or another remote backend) "
+                f"to execute this query against the remote service, "
+                f"or replace the qualified names with local asset names."
+            )
+
+        partitions_def = _parse_partitions_spec(spec.meta.get("partitions"))
         generated_assets = _build_asset_core(
             asset_name=spec.name,
             sql=spec.sql,
             meta=spec.meta,
             extra_deps=list(spec.extra_deps),
             group=group,
+            partitions_def=partitions_def,
         )
 
         for key, fn in generated_assets:

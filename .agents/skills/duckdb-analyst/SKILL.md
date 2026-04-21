@@ -21,7 +21,7 @@ Materialized Dagster assets live under `data/` in two directories:
 |---|---|---|
 | Landing | `data/landing/{asset_name}/...` | Gzipped CSV shards |
 | Clean (single file) | `data/clean/{asset_name}/{asset_name}.parquet` | Parquet |
-| Clean (partitioned) | `data/clean/{asset_name}/year={YYYY}/{asset_name}.parquet` | Hive-partitioned Parquet |
+| Clean (yearly partitioned) | `data/clean/{asset_name}/year={YYYY}/{asset_name}_{YYYY}.parquet` | Hive-partitioned Parquet |
 | Exports | `data/exports/{name}.{format}` | CSV, Parquet, or JSON |
 
 ## Quick Start
@@ -47,34 +47,57 @@ DuckDB reads files directly in SQL — no setup needed:
 
 ### Partitioned datasets
 
-Some pipeline assets produce hive-partitioned parquet (e.g., `year=2026/data.parquet`). DuckDB auto-detects hive partitions with glob patterns:
+Some assets produce hive-partitioned parquet (e.g., `year=2026/nyc_311_sample_2026.parquet`). Both Socrata staged pipelines (`nyc_311_sample`) and yearly-partitioned QueryStation assets (`mta_ridership_yearly`) use this layout. DuckDB auto-detects hive partitions with glob patterns:
 
 ```sql
--- All years
+-- All years (Socrata-backed, staged)
 SELECT year, count(*) as n
 FROM 'data/clean/nyc_311_sample/*/*.parquet'
 GROUP BY year ORDER BY year
 
 -- Single year
 SELECT * FROM 'data/clean/nyc_311_sample/year=2026/*.parquet' LIMIT 5
+
+-- Yearly-partitioned QueryStation asset (same layout, different source)
+SELECT year, mode, total_riders
+FROM 'data/clean/mta_ridership_yearly/*/*.parquet'
+ORDER BY year, mode
+```
+
+For recursive scans (mixed depths), use `**`:
+
+```sql
+SELECT * FROM 'data/clean/mta_ridership_yearly/**/*.parquet' LIMIT 5
 ```
 
 ## Available Assets
 
-These assets are defined as individual modules in `src/opendata_eda/defs/assets/`:
+All materialized assets — regardless of backend (Socrata, QueryStation remote, or local DuckDB-JIT) — land under `data/clean/{asset_name}/...`. The examples below treat them uniformly.
 
-### Socrata Pipeline Assets
+### Socrata pipeline assets
 
 | Asset | Type | Description |
 |---|---|---|
-| `nyc_311_sample` | Partitioned (monthly→yearly) | 311 service requests |
+| `nyc_311_sample` | Partitioned (monthly → yearly) | 311 service requests |
 | `nyc_film_permits` | Unpartitioned | NYC film/TV shooting permits |
 | `nyc_floodnet_sensor_metadata` | Unpartitioned | FloodNet sensor locations |
 | `nyc_floodnet_flooding_events` | Unpartitioned | Flood event measurements |
 | `nyc_floodnet_events_joined` | Unpartitioned | Events enriched with sensor metadata, severity, hydro metrics |
-| `nyc_dsny_monthly_tonnage` | Unpartitioned | DSNY monthly collection tonnage by community district (1990-present) |
+| `nyc_dsny_monthly_tonnage` | Unpartitioned | DSNY monthly collection tonnage by community district (1990–present) |
+| `nyc_motor_vehicle_collisions` | Unpartitioned | NYPD-reported motor vehicle crashes (2012–present) |
 
-### SQL Analytics Assets (downstream)
+### QueryStation remote assets (cached locally as Parquet)
+
+These are authored as `.sql` files with `source: querystation` — QueryStation executes them remotely, but results land in the same `data/clean/` tree and query identically.
+
+| Asset | Layout | Description |
+|---|---|---|
+| `mta_ridership_by_mode` | Single parquet | All-years per-mode MTA totals |
+| `mta_ridership_yearly` | Hive (`year=YYYY/`) | Per-year per-mode ridership aggregates |
+| `nyc_air_quality_annual` | Single parquet | Annual NO2 / PM2.5 / Ozone means across NYC neighborhoods |
+| `nyc_311_top_heat_bbls_by_cb` | Single parquet | Top 10 BBLs per community board by 311 heat complaints |
+
+### Local SQL analytics assets (downstream)
 
 | Asset | Upstream | Description |
 |---|---|---|
@@ -82,6 +105,10 @@ These assets are defined as individual modules in `src/opendata_eda/defs/assets/
 | `dsny_tonnage_borough_monthly` | `nyc_dsny_monthly_tonnage` | Borough-level monthly aggregates |
 | `dsny_tonnage_district_rankings` | `nyc_dsny_monthly_tonnage` | District rankings by refuse + recycling rate |
 | `dsny_tonnage_organics_rollout` | `nyc_dsny_monthly_tonnage` | Organics adoption tracking by borough/year |
+| `collisions_annual_summary` | `nyc_motor_vehicle_collisions` | Year-over-year collision counts |
+| `collisions_borough_monthly` | `nyc_motor_vehicle_collisions` | Borough × month breakdowns |
+| `collisions_contributing_factors` | `nyc_motor_vehicle_collisions` | Top contributing factors |
+| `transit_vs_air_quality` | `mta_ridership_yearly`, `nyc_air_quality_annual` | Cross-backend join — MTA ridership vs. air-quality aggregates |
 
 ## Common Query Patterns
 
@@ -158,7 +185,7 @@ SELECT jaro_winkler_similarity('MANHATTAN', borough) FROM '...'
 Two notebooks are available for interactive exploration:
 
 - **`notebooks/query_local.ipynb`** — Query local parquet files with Polars and DuckDB
-- **`notebooks/query_remote.ipynb`** — Query remote DuckLake via QueryStation Arrow IPC API
+- **`notebooks/query_remote.ipynb`** — Query remote QueryStation tables via Arrow IPC API
 
 ## Best Practices
 

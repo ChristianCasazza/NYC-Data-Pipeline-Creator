@@ -2133,6 +2133,7 @@ version = "0.1.0"
 source = { editable = "packages/opendata_framework" }
 dependencies = [
     { name = "dagster" },
+    { name = "data-consumers" },
     { name = "duckdb" },
     { name = "polars" },
     { name = "pyarrow" },
@@ -2146,6 +2147,7 @@ dependencies = [
 [package.metadata]
 requires-dist = [
     { name = "dagster", specifier = ">=1.12.10" },
+    { name = "data-consumers", editable = "packages/data_consumers" },
     { name = "duckdb", specifier = ">=1.4.0" },
     { name = "polars", specifier = ">=1.8.0" },
     { name = "pyarrow", specifier = ">=17.0.0" },

@@ -18,7 +18,11 @@ dependencies = [
     "sqlglot>=26.30.0",
     "universal_pathlib>=0.2.0",
     "pyyaml>=6.0",
+    "data-consumers",
 ]
+
+[tool.uv.sources]
+data-consumers = { workspace = true }
 
 [tool.hatch.build.targets.wheel]
 packages = ["opendata_framework"]

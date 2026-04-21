@@ -32,13 +32,15 @@ DISCOVERY_API = "https://api.us.socrata.com/api/catalog/v1"
 DOMAIN = "data.cityofnewyork.us"
 PAGE_SIZE = 100
 
-# Dataset IDs already built in this repo (from existing-patterns.md).
+# Socrata dataset IDs already built in this repo.
 # Used to flag rows so you know what's already covered.
 EXISTING_DATASET_IDS = {
     "erm2-nwe9",  # nyc_311_sample
     "tg4x-b46p",  # nyc_film_permits
     "aq7i-eu5q",  # nyc_floodnet_flooding_events
     "kb2e-tjy3",  # nyc_floodnet_sensor_metadata
+    "ebb7-mvp5",  # nyc_dsny_monthly_tonnage
+    "h9gi-nx95",  # nyc_motor_vehicle_collisions
 }
 
 CSV_COLUMNS = [

@@ -55,7 +55,7 @@ class QueryStationAuth:
         except ImportError as exc:
             raise ImportError(
                 "httpx is required for remote DuckDB. "
-                "Install with: pip install data-consumers[remote]"
+                "Install workspace dependencies with: uv sync"
             ) from exc
 
         r = httpx.post(

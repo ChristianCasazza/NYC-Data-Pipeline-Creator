@@ -1,7 +1,7 @@
 ---
 name: querystation
 description: >
-  Remote DuckDB query tool for querying DuckLake and Iceberg catalogs via the
+  Remote DuckDB query tool for querying remote catalogs via the
   QueryStation Arrow IPC API. Use when an agent needs to query remote data,
   browse remote catalogs, describe remote tables, or export remote query results.
   Triggers on: "query remote", "remote duckdb", "querystation", "lake.", "iceberg.",
@@ -13,11 +13,24 @@ description: >
 
 ## What is this?
 
-QueryStation gives you SQL access to NYC open data hosted in DuckLake and Apache Iceberg catalogs through a remote DuckDB server. You send SQL over HTTP, the server executes it, and you get results back as Polars DataFrames via Apache Arrow IPC.
+QueryStation gives you SQL access to NYC open data hosted behind a remote DuckDB server. You send SQL over HTTP, the server executes it, and you get results back as Polars DataFrames via Apache Arrow IPC.
 
 The data includes 311 service requests, capital budgets, city payroll, restaurant inspections, flood sensors, MTA ridership, and more — all pre-cleaned and enriched by the pipeline.
 
 All logic lives in `data_consumers.RemoteDuckDBWrapper` at `data_consumers/remote_duckdb_wrapper.py`. The CLI script and notebook are thin presentation layers over this class.
+
+## Three ways to use QueryStation in this repo
+
+This skill primarily documents **ad-hoc exploration** via the CLI, notebook, or `RemoteDuckDBWrapper`. For **repeatable** queries that should live in the Dagster asset graph — e.g. a query you'll re-run on a schedule, commit a result of, or use as input to downstream SQL — make it a Dagster asset instead.
+
+| You're running the query… | …do this |
+|---|---|
+| Once, just exploring | CLI / notebook / wrapper — this skill |
+| Regularly, or committing results | `.sql` file with `source: querystation` in `src/opendata_eda/defs/assets/sql_assets/` — see **asset-builder** skill |
+| Once but expensive, results will be reused | Same — materialize once, re-read parquet freely |
+| As input to other SQL analytics | Definitely an asset — downstream local SQL can reference it by bare name |
+
+The asset path gives you: parquet caching under `data/clean/`, partition templating (`{{partition_start}}`), retry policy (3× exponential backoff starting at 30s), auto row-count checks, and Dagster lineage. Same wire protocol underneath — it's the same `RemoteDuckDBWrapper` the wrapper section below describes, wrapped in a Dagster `ConfigurableResource`.
 
 ## Setup (one time)
 
@@ -42,11 +55,11 @@ AUTH_URL=https://api.querystation.app
 ### 3. Install dependencies
 
 ```bash
-# Install all dependencies
-uv pip install -e .
+# Install all workspace dependencies
+uv sync
 
-# For notebooks, also install the Jupyter kernel
-uv pip install -e ".[notebook]"
+# For notebooks, install the notebook extra
+uv sync --extra notebook
 ```
 
 ## How to use it
@@ -131,7 +144,7 @@ All remote tables use fully-qualified three-part names: `catalog.schema.table_na
 
 | Catalog | Description |
 |---|---|
-| `lake` | DuckLake tables (the primary data catalog) |
+| `lake` | Primary curated data catalog |
 | `iceberg` | Apache Iceberg tables |
 | `main_db` | User scratch space (temporary tables from previous sessions) |
 
@@ -218,7 +231,7 @@ ORDER BY c.complaints DESC
 
 ## Catalog Discovery
 
-The `/catalog` JSON endpoint is used instead of `information_schema` or `DESCRIBE` because DuckLake catalogs don't expose those reliably. The wrapper handles this automatically:
+The `/catalog` JSON endpoint is used instead of `information_schema` or `DESCRIBE` because the remote service exposes richer catalog metadata there. The wrapper handles this automatically:
 
 - `db.catalog()` — DataFrame of all tables with column counts
 - `db.describe("table")` — DataFrame of column names and types
@@ -280,9 +293,10 @@ RemoteDuckDBWrapper (remote_duckdb_wrapper.py)
 | `Name or service not known` | DNS can't resolve `AUTH_URL` | Check `AUTH_URL` in `.env` — production is `https://api.querystation.app` |
 | `No remoteUrl returned` | API key doesn't have active billing | Contact QueryStation for access |
 | `Malformed IPC file` | Using `pl.read_ipc_stream` instead of pyarrow | Already fixed in wrapper — make sure you're using latest `RemoteDuckDBWrapper` |
-| `ModuleNotFoundError: data_consumers` | Package not installed | Run `uv pip install -e .` |
+| `ModuleNotFoundError: data_consumers` | Package not installed | Run `uv sync` from the workspace root |
 
 ## Related Skills
 
-- **duckdb-analyst** — Local DuckDB queries against parquet files on disk
-- **project-guide** — Index of all available skills and nah permissions
+- **asset-builder** — Build a `.sql` file with `source: querystation` to materialize the query as a cached Dagster asset under `data/clean/`
+- **duckdb-analyst** — Query local parquet (including QueryStation assets cached locally) without hitting the remote server
+- **socrata-builder** — Ingest NYC Open Data from Socrata when a dataset isn't already in the QueryStation lake

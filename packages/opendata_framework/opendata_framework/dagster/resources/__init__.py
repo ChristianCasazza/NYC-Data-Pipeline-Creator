@@ -12,12 +12,16 @@ from opendata_framework.dagster.resources.io.landing_io_manager import (
 from opendata_framework.dagster.resources.io.polars_parquet_io_manager import (
     PolarsParquetIOManager as PolarsParquetIOManager,
 )
+from opendata_framework.dagster.resources.querystation_resource import (
+    QueryStationResource as QueryStationResource,
+)
 from opendata_framework.dagster.resources.socrata_resource import (
     SocrataResource as SocrataResource,
 )
 
 __all__ = [
     "CheckbookNYCResource",
+    "QueryStationResource",
     "SocrataResource",
     "JsonIOManager",
     "LandingIOManager",

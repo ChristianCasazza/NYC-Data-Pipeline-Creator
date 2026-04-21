@@ -9,3 +9,5 @@ logs/
 .venv/
 *.parquet
 .tmp_dagster_home_*
+.claude
+.codex

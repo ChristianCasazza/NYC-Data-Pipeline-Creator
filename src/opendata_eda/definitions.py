@@ -8,12 +8,17 @@ from opendata_framework.dagster import (
     SocrataResource,
     LandingIOManager,
     PolarsParquetIOManager,
+    QueryStationResource,
 )
 
 
 def _get_resources() -> dict:
     return {
         "socrata": SocrataResource(api_token=EnvVar("SOCRATA_API_TOKEN")),
+        "querystation": QueryStationResource(
+            api_key=EnvVar("QUERYSTATION_API_KEY"),
+            auth_url=EnvVar("AUTH_URL"),
+        ),
         "landing_io_manager": LandingIOManager(base_path="./data/landing"),
         "clean_large_io_manager": PolarsParquetIOManager(base_path="./data/clean"),
         "clean_single_io_manager": PolarsParquetIOManager(base_path="./data/clean"),

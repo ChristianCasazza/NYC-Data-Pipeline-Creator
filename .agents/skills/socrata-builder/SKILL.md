@@ -13,6 +13,15 @@ description: >
 
 Generates a complete Dagster Socrata pipeline (landing, clean) from a single dataset URL. Each pipeline is created as its own module in `src/opendata_eda/defs/assets/` using the `create_socrata_pipeline()` factory from the `opendata_framework` package.
 
+### Before reaching for Socrata
+
+QueryStation's `lake` catalog already hosts 17+ pre-cleaned NYC datasets (311, payroll, capital/expense budgets, restaurant inspections, FloodNet, MTA, checkbook spending, housing). If the dataset the user wants is already in that catalog, **prefer a QueryStation remote SQL asset** — it skips the ingestion stage entirely and gets you the same local Parquet output. See the **asset-builder** skill (Part 3) and the **querystation** skill.
+
+Use this Socrata builder when:
+- The dataset isn't in QueryStation's lake, or
+- You explicitly need to own the ingestion (custom schema contract, enrichments, private tokens), or
+- You want a full landing → clean lineage for auditing.
+
 ## Repo Layout
 
 This repo uses Dagster's `load_from_defs_folder()` for automatic asset discovery:
@@ -208,11 +217,11 @@ Check `src/opendata_eda/defs/assets/` before creating — these Socrata pipeline
 | tg4x-b46p | nyc_film_permits | `nyc_film_permits.py` | Unpartitioned |
 | kb2e-tjy3 | nyc_floodnet_sensor_metadata | `floodnet/sensor_metadata.py` | Unpartitioned |
 | aq7i-eu5q | nyc_floodnet_flooding_events | `floodnet/flooding_events.py` | Unpartitioned |
-| -- | nyc_floodnet_events_joined | `floodnet/events_joined.py` | Derived |
+| — | nyc_floodnet_events_joined | `floodnet/events_joined.py` | Derived |
 | ebb7-mvp5 | nyc_dsny_monthly_tonnage | `nyc_dsny_monthly_tonnage.py` | Unpartitioned |
 | h9gi-nx95 | nyc_motor_vehicle_collisions | `nyc_motor_vehicle_collisions.py` | Unpartitioned |
 
-SQL analytics assets also exist in `src/opendata_eda/defs/assets/sql_assets/` — check there before creating downstream assets.
+SQL analytics assets also exist in `src/opendata_eda/defs/assets/sql_assets/` — check there before creating downstream assets. This directory contains both local DuckDB-JIT analytics (e.g. `dsny_tonnage_annual_summary`, `collisions_annual_summary`) and QueryStation-backed remote assets (e.g. `mta_ridership_yearly`, `nyc_air_quality_annual`, `nyc_311_top_heat_bbls_by_cb`, `transit_vs_air_quality`).
 
 ## Batch Mode: Catalog CSV
 
