@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from pathlib import Path
 
 import polars as pl
@@ -9,6 +10,18 @@ import polars as pl
 from data_consumers._auth import QueryStationAuth
 
 logger = logging.getLogger(__name__)
+
+# Identifier guard for any value we splice into SQL.
+_SQL_IDENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def _check_ident(name: str, field: str) -> None:
+    """Reject identifiers that would break SQL interpolation."""
+    if not _SQL_IDENT.match(name):
+        raise ValueError(
+            f"{field}={name!r} is not a valid SQL identifier "
+            "(allowed: letters, digits, underscore; must start with letter/underscore)"
+        )
 
 
 class RemoteDuckDBWrapper:
@@ -110,8 +123,17 @@ class RemoteDuckDBWrapper:
             return pl.DataFrame({"catalog": [], "schema": [], "name": [], "columns": []})
         return df.select("catalog", "schema", "name", "columns")
 
-    def describe(self, table: str) -> pl.DataFrame:
-        """Return column names and types for a table via the /catalog endpoint."""
+    def describe(
+        self,
+        table: str,
+        *,
+        with_comments: bool = False,
+    ) -> pl.DataFrame:
+        """Return column names and types for a table.
+
+        With ``with_comments=True``, also left-joins per-column comments from
+        the catalog (extra ``comment`` column, NULL where unset).
+        """
         db, schema, name = self._parse_table_ref(table)
         payload = self.fetch_catalog()
         match = next(
@@ -124,11 +146,103 @@ class RemoteDuckDBWrapper:
             None,
         )
         if not match:
-            return pl.DataFrame({"column_name": [], "column_type": []})
+            base = pl.DataFrame({"column_name": [], "column_type": []})
+            return base.with_columns(pl.lit(None).alias("comment")) if with_comments else base
 
-        col_names = match.get("columnNames", [])
-        col_types = match.get("columnTypes", [])
-        return pl.DataFrame({"column_name": col_names, "column_type": col_types})
+        df = pl.DataFrame({
+            "column_name": match.get("columnNames", []),
+            "column_type": match.get("columnTypes", []),
+        })
+        if not with_comments:
+            return df
+        comments = self.column_comments(table)
+        return df.join(comments, on="column_name", how="left")
+
+    # ── Comments — DuckDB introspection ─────────────────────
+    #
+    # DuckDB exposes table/column comments via ``duckdb_tables()`` and
+    # ``duckdb_columns()``, which surface DuckLake's underlying metadata
+    # (the ``__ducklake_metadata_<catalog>`` schema) through a stable SQL
+    # API. Querying the metadata schema directly returns 500 from the
+    # QueryStation gateway — these introspection functions are the route
+    # that actually works through the public endpoint.
+
+    def table_comments(
+        self,
+        schema: str | None = None,
+        *,
+        catalog: str = "lake",
+        include_empty: bool = False,
+    ) -> pl.DataFrame:
+        """Return table-level comments visible to the gateway.
+
+        Args:
+            schema: Optional schema filter (e.g. ``'nyc_checkbook'``). ``None``
+                returns every schema in the catalog.
+            catalog: Catalog/database to look in. Defaults to ``'lake'`` (the
+                QueryStation curated catalog). Pass another DB name to look
+                elsewhere.
+            include_empty: When True, include tables that have no comment
+                (``comment`` will be NULL). Default False — only tables with
+                an actual comment string appear.
+
+        Returns:
+            DataFrame with columns ``schema_name``, ``table_name``, ``comment``.
+        """
+        _check_ident(catalog, "catalog")
+        where = [f"database_name = '{catalog}'"]
+        if schema is not None:
+            _check_ident(schema, "schema")
+            where.append(f"schema_name = '{schema}'")
+        if not include_empty:
+            where.append("comment IS NOT NULL")
+            where.append("comment != ''")
+        sql = (
+            "SELECT schema_name, table_name, comment "
+            "FROM duckdb_tables() "
+            f"WHERE {' AND '.join(where)} "
+            "ORDER BY schema_name, table_name"
+        )
+        return self.sql(sql)
+
+    def column_comments(
+        self,
+        table: str,
+        *,
+        include_empty: bool = True,
+    ) -> pl.DataFrame:
+        """Return per-column comments for one table.
+
+        Args:
+            table: ``'schema.table'`` or ``'catalog.schema.table'``. When the
+                catalog is omitted, defaults to ``'lake'`` (matches
+                ``_parse_table_ref``).
+            include_empty: When True (default), every declared column appears
+                — columns without a comment have NULL. When False, only
+                commented columns are returned.
+
+        Returns:
+            DataFrame with columns ``column_name``, ``comment``.
+        """
+        catalog, schema_name, table_name = self._parse_table_ref(table)
+        _check_ident(catalog, "catalog")
+        _check_ident(schema_name, "schema")
+        _check_ident(table_name, "table")
+        where = [
+            f"database_name = '{catalog}'",
+            f"schema_name = '{schema_name}'",
+            f"table_name = '{table_name}'",
+        ]
+        if not include_empty:
+            where.append("comment IS NOT NULL")
+            where.append("comment != ''")
+        sql = (
+            "SELECT column_name, comment "
+            "FROM duckdb_columns() "
+            f"WHERE {' AND '.join(where)} "
+            "ORDER BY column_index"
+        )
+        return self.sql(sql)
 
     def show_tables(self) -> None:
         """Print a summary of all remote tables to stdout."""

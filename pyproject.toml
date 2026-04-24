@@ -51,5 +51,14 @@ root_module = "opendata_eda"
 [tool.hatch.build.targets.wheel]
 packages = ["src/opendata_eda", "packages/opendata_framework", "packages/data_consumers", "scripts"]
 
+[tool.pytest.ini_options]
+testpaths = [
+    "packages/opendata_framework/tests",
+]
+addopts = "-v --tb=short"
+markers = [
+    "integration: marks tests requiring external services",
+]
+
 [tool.uv.workspace]
 members = ["packages/*"]

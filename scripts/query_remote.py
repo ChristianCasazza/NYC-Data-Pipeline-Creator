@@ -120,12 +120,33 @@ def cmd_catalog(db: RemoteDuckDBWrapper) -> int:
     return 0
 
 
-def cmd_describe(db: RemoteDuckDBWrapper, table: str) -> int:
-    df = db.describe(table)
+def cmd_describe(db: RemoteDuckDBWrapper, table: str, with_comments: bool = False) -> int:
+    df = db.describe(table, with_comments=with_comments)
     if df.is_empty():
         console.print(f"[red]Table not found:[/] {table}")
         return 1
-    _print_fancy_table(df, title=f"Schema: {table} ({df.height} columns)")
+    suffix = " · with comments" if with_comments else ""
+    _print_fancy_table(df, title=f"Schema: {table} ({df.height} columns){suffix}")
+    return 0
+
+
+def cmd_table_comments(db: RemoteDuckDBWrapper, schema: str | None) -> int:
+    df = db.table_comments(schema)
+    if df.is_empty():
+        scope = f"schema={schema}" if schema else "lake"
+        console.print(f"[dim]No table comments found ({scope}).[/]")
+        return 0
+    title = f"Table comments ({df.height})" + (f" — schema={schema}" if schema else "")
+    _print_fancy_table(df, title=title)
+    return 0
+
+
+def cmd_column_comments(db: RemoteDuckDBWrapper, table: str) -> int:
+    df = db.column_comments(table)
+    if df.is_empty():
+        console.print(f"[red]Table not found:[/] {table}")
+        return 1
+    _print_fancy_table(df, title=f"Column comments: {table} ({df.height} columns)")
     return 0
 
 
@@ -162,6 +183,12 @@ def main() -> int:
     parser.add_argument("--sql", dest="sql_flag", help="SQL to execute (flag form)")
     parser.add_argument("--catalog", action="store_true", help="Show catalogs, schemas, and tables")
     parser.add_argument("--describe", metavar="TABLE", help="Show schema of a table")
+    parser.add_argument("--with-comments", action="store_true",
+                        help="When used with --describe, also include per-column comments from DuckLake metadata")
+    parser.add_argument("--table-comments", nargs="?", const="__ALL__", metavar="SCHEMA",
+                        help="Show table-level comments. Optionally filter to one schema (e.g. --table-comments nyc_checkbook)")
+    parser.add_argument("--column-comments", metavar="TABLE",
+                        help="Show per-column comments for a table")
     parser.add_argument("--limit", type=int, default=50, help="Max rows to print (default: 50)")
     parser.add_argument(
         "--export", nargs=2, metavar=("NAME", "FORMAT"),
@@ -179,8 +206,13 @@ def main() -> int:
             return cmd_sql_folder(db, args.run_sql_folder, args.export_format)
         if args.catalog:
             return cmd_catalog(db)
+        if args.column_comments:
+            return cmd_column_comments(db, args.column_comments)
+        if args.table_comments:
+            schema = None if args.table_comments == "__ALL__" else args.table_comments
+            return cmd_table_comments(db, schema)
         if args.describe:
-            return cmd_describe(db, args.describe)
+            return cmd_describe(db, args.describe, with_comments=args.with_comments)
         if query:
             export_name = args.export[0] if args.export else None
             export_fmt = args.export[1] if args.export else "csv"

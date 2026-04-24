@@ -387,6 +387,31 @@ When writing a test that needs to override `QUERYSTATION_API_KEY` / `AUTH_URL`, 
 ### 9. QueryStation retry delays are long by design
 `RetryPolicy(max_retries=3, delay=30, backoff=EXPONENTIAL)` → attempts at 0s, 30s, 90s, 210s. A single materialization that exhausts all retries can take ~6 minutes. Do not set wrapping timeouts below 360s when testing retry behavior.
 
+### 10. QueryStation partition pruning needs `WHERE year = …` (not date ranges)
+The `lake.*` tables are Hive-partitioned on `year`. Partition pruning is **only** triggered when the WHERE clause references the partition column directly. A predicate on `created_date` / `transit_timestamp` / etc. does not trigger directory-level pruning — DuckDB will not synthesize `year = 2025` from a date range. Empirically: a year-filtered count returns in ~0.15s, an unfiltered MTA hourly aggregate takes 30s+ cold and exceeds the wrapper's hardcoded 30s timeout.
+
+```sql
+-- GOOD: prunes to one partition directory before any scan
+SELECT * FROM lake.nyc_operations.service_requests_311 WHERE year = 2025
+
+-- WORSE: scans every year's files, relies on row-group min/max stats
+SELECT * FROM lake.nyc_operations.service_requests_311
+WHERE created_date >= '2025-01-01' AND created_date < '2026-01-01'
+
+-- BEST: partition prune + row-group prune
+SELECT * FROM lake.nyc_operations.service_requests_311
+WHERE year = 2025 AND created_date >= '2025-06-01' AND created_date < '2025-07-01'
+```
+
+In `.sql` assets that use `{{partition_start}}` / `{{partition_end}}` against a date column: this works because the framework registers a yearly partition on the asset side, so each materialization scans one year's data anyway. The date predicate then prunes row-groups *within* that year. For ad-hoc CLI / wrapper queries against the same tables, prefer `WHERE year = …`.
+
+### 11. QueryStation rejects SQL that begins with a comment (HTTP 403)
+The endpoint has a SQL-injection defense at the proxy layer that fast-fails (~80ms) any request whose body starts with `/* … */` or `-- …`. Trailing comments are fine. Affects:
+- Cache-busting nonces — append `-- nonce: <uuid>` instead of prepending `/* nonce: … */`.
+- Query annotation tools that prepend metadata comments.
+
+`RemoteDuckDBWrapper.sql()` does not protect against this — your client code must put any comment after the SELECT.
+
 ## Agent Skills
 
 Four skills are available in `.agents/skills/`:

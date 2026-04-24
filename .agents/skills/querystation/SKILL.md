@@ -229,13 +229,75 @@ ON s.borough = c.borough
 ORDER BY c.complaints DESC
 ```
 
+## Partition Pruning — write filters the planner can use
+
+The `lake.*` tables are Hive-partitioned on `year`. Partition pruning (skipping entire directories before reading any Parquet) only fires when the WHERE clause **references the partition column directly**. The planner does not infer `year = 2025` from a date range on a different column.
+
+Empirical evidence (load tests):
+
+| Query | Latency |
+|---|---|
+| `WHERE year = 2025 AND month = 6` (311 count) | 0.15s |
+| `WHERE year = 2024 AND month = 1` (MTA hourly count) | 0.17s |
+| no WHERE — full-table aggregate (MTA hourly) | 29.85s cold (would time out at the wrapper's 30s ceiling) |
+
+That ~200× difference is partition pruning. Always include `WHERE year = …` (or `IN (…)` / `BETWEEN`) when scanning year-partitioned tables.
+
+```sql
+-- GOOD: prunes to one partition directory
+SELECT * FROM lake.nyc_operations.service_requests_311 WHERE year = 2025
+
+-- WORSE: scans every year's files, relies on row-group min/max stats
+SELECT * FROM lake.nyc_operations.service_requests_311
+WHERE created_date >= '2025-01-01' AND created_date < '2026-01-01'
+
+-- BEST: partition prune + row-group prune (combine both)
+SELECT * FROM lake.nyc_operations.service_requests_311
+WHERE year = 2025
+  AND created_date >= '2025-06-01' AND created_date < '2025-07-01'
+```
+
+**Practical rules:**
+1. Touching one year? `WHERE year = 2025`.
+2. Touching a year range? `WHERE year BETWEEN 2024 AND 2025` (or `IN (…)`).
+3. Touching a sub-year window? Combine: `WHERE year = 2025 AND <date_col> BETWEEN '…' AND '…'`.
+4. Aggregating across all years? At minimum, materialize once with the full scan and reuse — don't re-pay the cost on every query.
+
+`RemoteDuckDBWrapper.sql()` hardcodes a 30s HTTP timeout. An unfiltered aggregate on a large table (MTA hourly especially) will hit that ceiling cold. If you genuinely need a full scan, use the load-test script's pattern: send the request via `httpx` directly with a longer timeout, or push the query into a Dagster QueryStation asset (which has retry + longer timeout built in).
+
 ## Catalog Discovery
 
 The `/catalog` JSON endpoint is used instead of `information_schema` or `DESCRIBE` because the remote service exposes richer catalog metadata there. The wrapper handles this automatically:
 
 - `db.catalog()` — DataFrame of all tables with column counts
 - `db.describe("table")` — DataFrame of column names and types
+- `db.describe("table", with_comments=True)` — same, plus a `comment` column joined in from `duckdb_columns()`
 - `db.fetch_catalog()` — raw JSON dict for advanced use
+
+### Comments (table & column descriptions)
+
+DuckLake-backed tables can carry per-table and per-column comments (set during materialization from the schema-contract 3-tuples and pipeline `description=` kwargs). The wrapper exposes them via DuckDB's introspection functions (`duckdb_tables()` / `duckdb_columns()`):
+
+```python
+db.table_comments()                   # every commented table in catalog 'lake'
+db.table_comments("nyc_checkbook")    # one schema's tables only
+db.column_comments("lake.nyc_checkbook.checkbook_contracts_reg_expense")
+db.describe("lake.nyc_finance.capital_budget", with_comments=True)
+```
+
+CLI equivalents:
+
+```bash
+uv run python scripts/query_remote.py --table-comments              # all schemas
+uv run python scripts/query_remote.py --table-comments nyc_checkbook
+uv run python scripts/query_remote.py --column-comments lake.nyc_checkbook.checkbook_contracts_reg_expense
+uv run python scripts/query_remote.py --describe lake.nyc_finance.capital_budget --with-comments
+```
+
+Implementation notes:
+- The metadata physically lives in the DuckLake catalog's `__ducklake_metadata_<catalog>.public.ducklake_tag` / `ducklake_column_tag` tables (snapshot-versioned, `key='comment'`, filter `end_snapshot IS NULL`). **Querying that schema directly through the QueryStation SQL gateway returns 500** — the gateway exposes the metadata DB in `SHOW DATABASES` but blocks reads from it. The wrapper deliberately uses `duckdb_columns()` / `duckdb_tables()` instead because those go through DuckDB's stable introspection layer, which is permitted.
+- `column_comments(table, include_empty=True)` (the default) returns one row per declared column — columns without a comment have NULL, so you can immediately spot which raw-API columns are missing descriptions.
+- Comments only exist for columns whose schema contract was declared as a 3-tuple `(target, dtype, description)`. 2-tuple `(target, dtype)` declarations produce no comment. Same for table-level comments — the `description=` kwarg on `create_socrata_pipeline()` / `create_checkbook_pipeline()` is what populates `duckdb_tables().comment`.
 
 ## Arrow IPC Notes
 
@@ -294,6 +356,8 @@ RemoteDuckDBWrapper (remote_duckdb_wrapper.py)
 | `No remoteUrl returned` | API key doesn't have active billing | Contact QueryStation for access |
 | `Malformed IPC file` | Using `pl.read_ipc_stream` instead of pyarrow | Already fixed in wrapper — make sure you're using latest `RemoteDuckDBWrapper` |
 | `ModuleNotFoundError: data_consumers` | Package not installed | Run `uv sync` from the workspace root |
+| `HTTP 403` (~80ms fast-fail) | SQL begins with a comment (`/* … */ SELECT …` or `-- …\nSELECT …`). Endpoint has a SQLi defense at the proxy layer. | Move the comment to the end (`SELECT … -- comment`) or inline it after the SELECT. |
+| `Read timed out` (~30s) | `RemoteDuckDBWrapper.sql()` uses a hardcoded 30s timeout, and your query is doing a full-table scan or unfiltered aggregate on a large table | Add `WHERE year = …` to trigger partition pruning (see "Partition Pruning" above). For genuinely-large pulls, send via `httpx` directly with a larger timeout, or use a Dagster QueryStation asset (retry + longer timeout built in). |
 
 ## Related Skills
 

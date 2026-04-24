@@ -396,6 +396,28 @@ WHERE date >= {{partition_start}}
 GROUP BY 1, 2
 ```
 
+### Partition pruning on the remote side
+
+The `{{partition_*}}` tokens render as **date-column predicates** (`WHERE date >= '2025-01-01'`). That gets you row-group pruning via Parquet min/max stats inside whichever year-partition directories the planner ends up reading — but it does **not** trigger Hive directory pruning on the remote `lake.*` tables, because those tables are partitioned on `year` (not on `date`).
+
+For partitioned QueryStation assets this is fine: each materialization fires one query per partition, so the bounded date range naturally limits the scan even without directory pruning.
+
+For unpartitioned QueryStation assets, or for any SQL that needs to scan a lot of data fast, **add an explicit `WHERE year = …` (or `IN (…)` / `BETWEEN`)** alongside any date predicate:
+
+```sql
+-- GOOD: partition prune (year) + row-group prune (date)
+SELECT * FROM lake.nyc_operations.service_requests_311
+WHERE year = 2025
+  AND created_date >= '2025-06-01'
+  AND created_date <  '2025-07-01'
+
+-- WORSE: only row-group pruning, scans every year's files
+SELECT * FROM lake.nyc_operations.service_requests_311
+WHERE created_date >= '2025-06-01' AND created_date < '2025-07-01'
+```
+
+A year-filtered query against a large remote table is ~200× faster than the unfiltered version (load-test data: 0.15s vs 30s+). DuckDB does not synthesize `year = 2025` from a date range on `created_date`. See the **querystation** skill for the full discussion and benchmarks.
+
 ### Templating tokens
 
 `render_sql()` lives in `packages/opendata_framework/opendata_framework/core/sql/runner_querystation.py`. Missing context raises at render time — no silent fallthrough to a full-table scan per partition.
